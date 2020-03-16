@@ -14,6 +14,7 @@ use English '-no_match_vars';
 # Convert die to confess to capture the stack trace
 $SIG{__DIE__} = sub { Carp::confess @_ };
 
+use Digest::SHA qw(sha1_hex);
 use File::Basename qw(dirname);
 use Getopt::Long qw(GetOptions);
 use Cwd qw(abs_path cwd);
@@ -75,7 +76,8 @@ test.pl [options]
    --no-cleanup         don't cleanup after the last test is complete - useful for debugging
    --pg-version         version of postgres to test (all, defaults to minimal)
    --log-force          force overwrite of current test log files
-   --build-only         compile the test library / packages and run tests only
+   --build-only         build the binary (and honor --build-package) but don't run tests
+   --build-package      build the package
    --build-max          max processes to use for builds (default 4)
    --coverage-only      only run coverage tests (as a subset of selected tests)
    --c-only             only run C tests
@@ -84,10 +86,9 @@ test.pl [options]
    --no-gen             do not run code generation
    --code-count         generate code counts
    --smart              perform bin/package builds only when source timestamps have changed
-   --no-package         do not build packages
-   --dev                --smart --no-package --no-optimize
-   --dev-test           --no-package
-   --expect             --no-package --vm=co7 --db=9.6 --log-force
+   --dev                --smart --no-optimize
+   --dev-test           does nothing -- kept for backward compatibility
+   --expect             --vm=co7 --db=9.6 --log-force
    --no-valgrind        don't run valgrind on C unit tests (saves time)
    --no-coverage        don't run coverage on C unit tests (saves time)
    --no-optimize        don't do compile optimization for C (saves compile time)
@@ -147,6 +148,7 @@ my $strVmHost = VM_HOST_DEFAULT;
 my $bVmBuild = false;
 my $bVmForce = false;
 my $bBuildOnly = false;
+my $bBuildPackage = false;
 my $iBuildMax = 4;
 my $bCoverageOnly = false;
 my $bCoverageSummary = false;
@@ -157,7 +159,6 @@ my $bGenOnly = false;
 my $bNoGen = false;
 my $bCodeCount = false;
 my $bSmart = false;
-my $bNoPackage = false;
 my $bDev = false;
 my $bDevTest = false;
 my $bBackTrace = false;
@@ -196,8 +197,8 @@ GetOptions ('q|quiet' => \$bQuiet,
             'pg-version=s' => \$strPgVersion,
             'log-force' => \$bLogForce,
             'build-only' => \$bBuildOnly,
+            'build-package' => \$bBuildPackage,
             'build-max=s' => \$iBuildMax,
-            'no-package' => \$bNoPackage,
             'coverage-only' => \$bCoverageOnly,
             'coverage-summary' => \$bCoverageSummary,
             'no-coverage' => \$bNoCoverage,
@@ -277,13 +278,7 @@ eval
     if ($bDev)
     {
         $bSmart = true;
-        $bNoPackage = true;
         $bNoOptimize = true;
-    }
-
-    if ($bDevTest)
-    {
-        $bNoPackage = true;
     }
 
     ################################################################################################################################
@@ -300,7 +295,6 @@ eval
     ################################################################################################################################
     if ($bExpect)
     {
-        $bNoPackage = true;
         $strVm = VM_EXPECT;
         $strPgVersion = '9.6';
         $bLogForce = true;
@@ -420,7 +414,8 @@ eval
                 trim(
                     executeTest(
                         "git -C ${strBackRestBase} ls-files -c --others --exclude-standard |" .
-                            " rsync -rtW --out-format=\"\%n\" --delete --ignore-missing-args --exclude=repo.manifest" .
+                            " rsync -rtW --out-format=\"\%n\" --delete --ignore-missing-args" .
+                            " --exclude=test/result --exclude=repo.manifest" .
                             " ${strBackRestBase}/ --files-from=- ${strRepoCachePath}"))));
 
         if (@stryModifiedList > 0)
@@ -486,21 +481,39 @@ eval
             #-----------------------------------------------------------------------------------------------------------------------
             if (!$bSmart || grep(/^src\/build\/configure\.ac/, @stryModifiedList))
             {
-                my $strConfigure = executeTest("autoconf ${strBackRestBase}/src/build/configure.ac");
-
-                # Trim off any trailing LFs
-                $strConfigure = trim($strConfigure) . "\n";
-
-                # Remove unused options from help
-                $strConfigure =~ s/^  --((?!bin).)*dir=DIR.*\n//mg;
-                $strConfigure =~ s/^  --sbindir=DIR.*\n//mg;
-
-                # Save into the src dir
+                # Set build file
                 my @stryBuilt;
                 my $strBuilt = 'src/configure';
 
-                if (buildPutDiffers($oStorageBackRest, "${strBackRestBase}/${strBuilt}", $strConfigure))
+                # Get configure.ac and configure to see if anything has changed
+                my $strConfigureAc = ${$oStorageBackRest->get('src/build/configure.ac')};
+                my $strConfigureAcHash = sha1_hex($strConfigureAc);
+                my $rstrConfigure = $oStorageBackRest->get($oStorageBackRest->openRead($strBuilt, {bIgnoreMissing => true}));
+
+                # Check if configure needs to be regenerated
+                if (!defined($rstrConfigure) || !defined($$rstrConfigure) ||
+                    $strConfigureAcHash ne substr($$rstrConfigure, length($$rstrConfigure) - 41, 40))
                 {
+                    # Generate aclocal.m4
+                    my $strAcLocal = executeTest("cd ${strBackRestBase}/src/build && aclocal --OUT=-");
+                    $strAcLocal = trim($strAcLocal) . "\n";
+
+                    buildPutDiffers($oStorageBackRest, "${strBackRestBase}/src/build/aclocal.m4", $strAcLocal);
+
+                    # Generate configure
+                    my $strConfigure = executeTest("cd ${strBackRestBase}/src/build && autoconf --output=-");
+                    $strConfigure =
+                        trim($strConfigure) . "\n\n# Generated from src/build/configure.ac sha1 ${strConfigureAcHash}\n";
+
+                    # Remove unused options from help
+                    $strConfigure =~ s/^  --((?!bin).)*dir=DIR.*\n//mg;
+                    $strConfigure =~ s/^  --sbindir=DIR.*\n//mg;
+
+                    # Save into the src dir
+                    $oStorageBackRest->put(
+                        $oStorageBackRest->openWrite("${strBackRestBase}/${strBuilt}", {strMode => '0755'}), $strConfigure);
+
+                    # Add to built list
                     push(@stryBuilt, $strBuilt);
                     push(@stryBuiltAll, @stryBuilt);
                     push(@stryModifiedList, @stryBuilt);
@@ -570,7 +583,7 @@ eval
         my $bVersionDev = true;
         my $strVersionBase;
 
-        if (!$bDev)
+        if (!$bDev || $bBuildPackage)
         {
             # Make sure version number matches the latest release
             #-----------------------------------------------------------------------------------------------------------------------
@@ -610,7 +623,7 @@ eval
         my $iTestFail = 0;
         my $iTestRetry = 0;
         my $oyProcess = [];
-        my $strCodePath = "${strBackRestBase}/test/.vagrant/code";
+        my $strCodePath = "${strBackRestBase}/test/result/coverage/raw";
 
         if (!$bDryRun || $bVmOut)
         {
@@ -626,25 +639,24 @@ eval
                 push(@{$oyProcess}, undef);
             }
 
-            executeTest("rm -rf ${strTestPath}/test-* ${strTestPath}/data-*" . ($bDev ? '' : " ${strTestPath}/gcov-*"));
-            $oStorageTest->pathCreate($strTestPath, {strMode => '0770', bIgnoreExists => true, bCreateParent => true});
+            executeTest(
+                "rm -rf ${strTestPath}/temp ${strTestPath}/test-* ${strTestPath}/data-*" . ($bDev ? '' : " ${strTestPath}/gcov-*"));
+            $oStorageTest->pathCreate("${strTestPath}/temp", {strMode => '0770', bIgnoreExists => true, bCreateParent => true});
 
-            # Remove old coverage dirs -- do it this way so the dirs stay open in finder/explorer, etc.
-            executeTest("rm -rf ${strBackRestBase}/test/coverage/c/*");
+            # Remove old lcov dirs -- do it this way so the dirs stay open in finder/explorer, etc.
+            executeTest("rm -rf ${strBackRestBase}/test/result/coverage/lcov/*");
 
             # Overwrite the C coverage report so it will load but not show old coverage
-            $oStorageTest->pathCreate("${strBackRestBase}/test/coverage", {strMode => '0770', bIgnoreExists => true});
+            $oStorageTest->pathCreate(
+                "${strBackRestBase}/test/result/coverage", {strMode => '0770', bIgnoreExists => true, bCreateParent => true});
             $oStorageBackRest->put(
-                "${strBackRestBase}/test/coverage/c-coverage.html", "<center>[ Generating New Report ]</center>");
+                "${strBackRestBase}/test/result/coverage/coverage.html", "<center>[ Generating New Report ]</center>");
 
             # Copy C code for coverage tests
             if (vmCoverageC($strVm) && !$bDryRun)
             {
-                $oStorageTest->pathCreate("${strCodePath}/test", {strMode => '0770', bIgnoreExists => true, bCreateParent => true});
-
-                executeTest(
-                    "rsync -rt --delete --exclude=test ${strBackRestBase}/src/ ${strCodePath} && " .
-                    "rsync -rt --delete ${strBackRestBase}/test/src/module/ ${strCodePath}/test");
+                executeTest("rm -rf ${strBackRestBase}/test/result/coverage/raw/*");
+                $oStorageTest->pathCreate("${strCodePath}", {strMode => '0770', bIgnoreExists => true, bCreateParent => true});
             }
         }
 
@@ -699,14 +711,13 @@ eval
 
         &log(INFO, "builds required: ${strBuildRequired}");
 
-        # Build the binary, library and packages
+        # Build the binary and packages
         #---------------------------------------------------------------------------------------------------------------------------
         if (!$bDryRun)
         {
             my $oVm = vmGet();
             my $lTimestampLast;
-            my @stryBinSrcPath = ('src');
-            my $strBinPath = "${strVagrantPath}/bin";
+            my $strBinPath = "${strTestPath}/bin";
             my $rhBinBuild = {};
 
             # Build the binary
@@ -714,7 +725,7 @@ eval
             if ($bBinRequired)
             {
                 # Find the lastest modified time for dirs that affect the bin build
-                $lTimestampLast = buildLastModTime($oStorageBackRest, $strBackRestBase, \@stryBinSrcPath);
+                $lTimestampLast = buildLastModTime($oStorageBackRest, $strBackRestBase, ['src']);
 
                 # Loop through VMs to do the C bin builds
                 my $bLogDetail = $strLogLevel eq 'detail';
@@ -728,7 +739,7 @@ eval
 
                 foreach my $strBuildVM (@stryBuildVm)
                 {
-                    my $strBuildPath = "${strBinPath}/${strBuildVM}/src";
+                    my $strBuildPath = "${strBinPath}/${strBuildVM}";
                     my $bRebuild = !$bSmart;
                     $rhBinBuild->{$strBuildVM} = true;
 
@@ -743,9 +754,9 @@ eval
                     my $strBuildFlagFile = "${strBinPath}/${strBuildVM}/build.flags";
 
                     my $bBuildOptionsDiffer = buildPutDiffers($oStorageBackRest, $strBuildFlagFile, $strBuildFlags);
-                    $bBuildOptionsDiffer |= grep(/^src\/configure|src\/Makefile.in|src\/build\.auto\.h$/, @stryModifiedList);
+                    $bBuildOptionsDiffer |= grep(/^src\/configure|src\/Makefile.in|src\/build\.auto\.h\.in$/, @stryModifiedList);
 
-                    # Rebuild if the modification time of the smart file does equal the last changes in source paths
+                    # Rebuild if the modification time of the bin file is less than the last changes in source paths
                     my $strBinSmart = "${strBuildPath}/pgbackrest";
 
                     if ($bBuildOptionsDiffer ||
@@ -753,7 +764,9 @@ eval
                          (!$oStorageBackRest->exists($strBinSmart) ||
                           $oStorageBackRest->info($strBinSmart)->mtime < $lTimestampLast)))
                     {
-                        &log(INFO, "    bin dependencies have changed for ${strBuildVM}, rebuilding...");
+                        &log(
+                            INFO, "    bin dependencies have changed for ${strBuildVM}, " . ($bBuildOptionsDiffer ? 're' : '') .
+                            'building...');
 
                         $bRebuild = true;
                     }
@@ -766,32 +779,25 @@ eval
                         {
                             executeTest(
                                 "docker run -itd -h test-build --name=test-build" .
-                                " -v ${strBackRestBase}:${strBackRestBase} " . containerRepo() . ":${strBuildVM}-test",
+                                    " -v ${strBackRestBase}:${strBackRestBase} -v ${strTestPath}:${strTestPath} " .
+                                    containerRepo() . ":${strBuildVM}-test",
                                 {bSuppressStdErr => true});
                         }
 
-                        foreach my $strBinSrcPath (@stryBinSrcPath)
+                        if (!$bSmart || $bBuildOptionsDiffer || !$oStorageBackRest->exists("${strBuildPath}/Makefile"))
                         {
-                            $oStorageBackRest->pathCreate(
-                                "${strBinPath}/${strBuildVM}/${strBinSrcPath}", {bIgnoreExists => true, bCreateParent => true});
-                        }
+                            # Remove old path if it exists and save the build flags
+                            executeTest("rm -rf ${strBuildPath}");
+                            buildPutDiffers($oStorageBackRest, $strBuildFlagFile, $strBuildFlags);
 
-                        executeTest(
-                            "rsync -rt" . (!$bSmart || $bBuildOptionsDiffer ? " --delete-excluded" : '') .
-                            " --include=" . join('/*** --include=', @stryBinSrcPath) . '/*** --exclude=*' .
-                            " ${strBackRestBase}/ ${strBinPath}/${strBuildVM}");
-                        buildPutDiffers($oStorageBackRest, $strBuildFlagFile, $strBuildFlags);
-
-                        if ($bBuildOptionsDiffer || !$oStorageBackRest->exists("${strBuildPath}/Makefile"))
-                        {
                             executeTest(
-                                ($strBuildVM ne VM_NONE ? 'docker exec -i test-build ' : '') .
-                                "bash -c 'cd ${strBuildPath} && ./configure${strConfigOptions}'",
+                                ($strBuildVM ne VM_NONE ? 'docker exec -i -u ' . TEST_USER . ' test-build ' : '') .
+                                "bash -c 'cd ${strBuildPath} && ${strBackRestBase}/src/configure${strConfigOptions}'",
                                 {bShowOutputAsync => $bLogDetail});
                         }
 
                         executeTest(
-                            ($strBuildVM ne VM_NONE ? 'docker exec -i test-build ' : '') .
+                            ($strBuildVM ne VM_NONE ? 'docker exec -i -u ' . TEST_USER . ' test-build ' : '') .
                             "make -j ${iBuildMax}" . ($bLogDetail ? '' : ' --silent') .
                                 " --directory ${strBuildPath} CFLAGS='${strCFlags}' LDFLAGS='${strLdFlags}'",
                             {bShowOutputAsync => $bLogDetail});
@@ -806,37 +812,9 @@ eval
 
             # Build the package
             #-----------------------------------------------------------------------------------------------------------------------
-            if (!$bNoPackage && $strVm ne VM_NONE)
+            if ($bBuildPackage && $strVm ne VM_NONE)
             {
-                my $strPackagePath = "${strVagrantPath}/package";
-                my $strPackageSmart = "${strPackagePath}/build.timestamp";
-                my @stryPackageSrcPath = ('src');
-
-                # Find the lastest modified time for additional dirs that affect the package build
-                foreach my $strPackageSrcPath (@stryPackageSrcPath)
-                {
-                    my $hManifest = $oStorageBackRest->manifest($strPackageSrcPath);
-
-                    foreach my $strFile (sort(keys(%{$hManifest})))
-                    {
-                        if ($hManifest->{$strFile}{type} eq 'f' && $hManifest->{$strFile}{modification_time} > $lTimestampLast)
-                        {
-                            $lTimestampLast = $hManifest->{$strFile}{modification_time};
-                        }
-                    }
-                }
-
-                # Rebuild if the modification time of the smart file does not equal the last changes in source paths
-                if ((!$bSmart || !$oStorageBackRest->exists($strPackageSmart) ||
-                     $oStorageBackRest->info($strPackageSmart)->mtime < $lTimestampLast))
-                {
-                    if ($bSmart)
-                    {
-                        &log(INFO, 'package dependencies have changed, rebuilding...');
-                    }
-
-                    executeTest("rm -rf ${strPackagePath}");
-                }
+                my $strPackagePath = "${strBackRestBase}/test/result/package";
 
                 # Loop through VMs to do the package builds
                 my @stryBuildVm = $strVm eq VM_ALL ? VM_LIST : ($strVm);
@@ -844,9 +822,9 @@ eval
 
                 foreach my $strBuildVM (@stryBuildVm)
                 {
-                    my $strBuildPath = "${strPackagePath}/${strBuildVM}/src";
+                    my $strBuildPath = "${strPackagePath}/${strBuildVM}";
 
-                    if (!$oStorageBackRest->pathExists($strBuildPath) && $oVm->{$strBuildVM}{&VM_OS_BASE} eq VM_OS_BASE_DEBIAN)
+                    if ($oVm->{$strBuildVM}{&VM_OS_BASE} eq VM_OS_BASE_DEBIAN)
                     {
                         &log(INFO, "build package for ${strBuildVM} (${strBuildPath})");
 
@@ -865,7 +843,9 @@ eval
                             ($strVm ne VM_NONE ? "docker exec -i test-build " : '') .
                             "bash -c 'git clone https://salsa.debian.org/postgresql/pgbackrest.git /root/package-src 2>&1'");
 
-                        executeTest("rsync -r --exclude .vagrant --exclude .git ${strBackRestBase}/ ${strBuildPath}/");
+                        executeTest(
+                            "rsync -r --exclude=.vagrant --exclude=.git --exclude=test/result ${strBackRestBase}/" .
+                                " ${strBuildPath}/");
                         executeTest(
                             ($strVm ne VM_NONE ? "docker exec -i test-build " : '') .
                             "bash -c 'cp -r /root/package-src/debian ${strBuildPath} && sudo chown -R " . TEST_USER .
@@ -875,7 +855,7 @@ eval
                         #
                         # Use these commands to create a new patch (may need to modify first line):
                         # BRDIR=/backrest;BRVM=u18;BRPATCHFILE=${BRDIR?}/test/patch/debian-package.patch
-                        # DBDIR=${BRDIR?}/test/.vagrant/package/${BRVM}/src/debian
+                        # DBDIR=${BRDIR?}/test/result/package/${BRVM}/debian
                         # diff -Naur ${DBDIR?}.old ${DBDIR}.new > ${BRPATCHFILE?}
                         my $strDebianPackagePatch = "${strBackRestBase}/test/patch/debian-package.patch";
 
@@ -925,7 +905,7 @@ eval
                         }
                     }
 
-                    if (!$oStorageBackRest->pathExists($strBuildPath) && $oVm->{$strBuildVM}{&VM_OS_BASE} eq VM_OS_BASE_RHEL)
+                    if ($oVm->{$strBuildVM}{&VM_OS_BASE} eq VM_OS_BASE_RHEL)
                     {
                         &log(INFO, "build package for ${strBuildVM} (${strBuildPath})");
 
@@ -981,7 +961,7 @@ eval
                         #
                         # Use these commands to create a new patch (may need to modify first line):
                         # BRDIR=/backrest;BRVM=co7;BRPATCHFILE=${BRDIR?}/test/patch/rhel-package.patch
-                        # PKDIR=${BRDIR?}/test/.vagrant/package/${BRVM}/src/SPECS
+                        # PKDIR=${BRDIR?}/test/result/package/${BRVM}/SPECS
                         # diff -Naur ${PKDIR?}.old ${PKDIR}.new > ${BRPATCHFILE?}
                         my $strPackagePatch = "${strBackRestBase}/test/patch/rhel-package.patch";
 
@@ -1009,14 +989,6 @@ eval
                             executeTest("docker rm -f test-build");
                         }
                     }
-                }
-
-                # Write files to indicate the last time a build was successful
-                if (!$bNoPackage)
-                {
-                    $oStorageBackRest->put($strPackageSmart);
-                    utime($lTimestampLast, $lTimestampLast, $strPackageSmart) or
-                        confess "unable to set time for ${strPackageSmart}" . (defined($!) ? ":$!" : '');
                 }
             }
 
@@ -1206,14 +1178,14 @@ eval
             {
                 &log(INFO, 'writing C coverage report');
 
-                my $strLCovFile = "${strBackRestBase}/test/.vagrant/code/all.lcov";
+                my $strLCovFile = "${strTestPath}/temp/all.lcov";
 
                 if ($oStorageBackRest->exists($strLCovFile))
                 {
                     executeTest(
-                        "genhtml ${strLCovFile} --config-file=${strBackRestBase}/test/.vagrant/code/lcov.conf" .
-                            " --prefix=${strBackRestBase}/test/.vagrant/code" .
-                            " --output-directory=${strBackRestBase}/test/coverage/c");
+                        "genhtml ${strLCovFile} --config-file=${strBackRestBase}/test/result/coverage/raw/lcov.conf" .
+                            " --prefix=${strTestPath}/repo" .
+                            " --output-directory=${strBackRestBase}/test/result/coverage/lcov");
 
                     foreach my $strCodeModule (sort(keys(%{$hCoverageActual})))
                     {
@@ -1225,7 +1197,7 @@ eval
 
                         my $strCoverageFile = $strCodeModule;
                         $strCoverageFile =~ s/^module/test/mg;
-                        $strCoverageFile = "${strBackRestBase}/test/.vagrant/code/${strCoverageFile}.lcov";
+                        $strCoverageFile = "${strBackRestBase}/test/result/coverage/raw/${strCoverageFile}.lcov";
 
                         my $strCoverage = $oStorageBackRest->get(
                             $oStorageBackRest->openRead($strCoverageFile, {bIgnoreMissing => true}));
@@ -1268,23 +1240,22 @@ eval
                         }
                     }
 
-                    $oStorageBackRest->remove("${strBackRestBase}/test/.vagrant/code/all.lcov", {bIgnoreMissing => true});
                     coverageGenerate(
-                        $oStorageBackRest, "${strBackRestBase}/test/.vagrant/code",
-                        "${strBackRestBase}/test/coverage/c-coverage.html");
+                        $oStorageBackRest, "${strTestPath}/repo", "${strBackRestBase}/test/result/coverage/raw",
+                        "${strBackRestBase}/test/result/coverage/coverage.html");
 
                     if ($bCoverageSummary)
                     {
                         &log(INFO, 'writing C coverage summary report');
 
                         coverageDocSummaryGenerate(
-                            $oStorageBackRest, "${strBackRestBase}/test/.vagrant/code",
+                            $oStorageBackRest, "${strBackRestBase}/test/result/coverage/raw",
                             "${strBackRestBase}/doc/xml/auto/metric-coverage-report.auto.xml");
                     }
                 }
                 else
                 {
-                    executeTest("rm -rf ${strBackRestBase}/test/coverage/c");
+                    executeTest("rm -rf ${strBackRestBase}/test/tesult/coverage");
                 }
             }
         }
@@ -1321,8 +1292,8 @@ eval
         $strVm, $iVmId,                                             # Vm info
         $strBackRestBase,                                           # Base backrest directory
         $strTestPath,                                               # Path where the tests will run
-        '/usr/bin/' . PROJECT_EXE,                                  # Path to the backrest executable
-        "${strVagrantPath}/bin/" . VM_NONE . '/src/' . PROJECT_EXE, # Path to the backrest Perl storage helper
+        dirname($strTestPath) . "/bin/${strVm}/" . PROJECT_EXE,     # Path to the pgbackrest binary
+        dirname($strTestPath) . "/bin/" . VM_NONE . '/' . PROJECT_EXE,  # Path to the backrest Perl storage helper
         $strPgVersion ne 'minimal' ? $strPgSqlBin: undef,           # Pg bin path
         $strPgVersion ne 'minimal' ? $strPgVersion: undef,          # Pg version
         $stryModule[0], $stryModuleTest[0], \@iyModuleTestRun,      # Module info
